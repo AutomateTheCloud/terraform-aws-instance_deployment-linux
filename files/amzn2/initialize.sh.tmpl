@@ -1,0 +1,8 @@
+#!/bin/bash -x
+/usr/bin/systemctl stop update-motd.service; sync; wait; yum -y update
+yum -y update aws-cfn-bootstrap
+if ! rpm -qa | grep -qw amazon-cloudwatch-agent; then
+  yum -y install https://s3.${region}.amazonaws.com/amazoncloudwatch-agent-${region}/amazon_linux/amd64/latest/amazon-cloudwatch-agent.rpm
+fi
+/opt/aws/bin/cfn-init -v --stack ${stack_name} --resource LaunchTemplate --region ${region} --configset "LinuxConfig,InstallConfigure"
+/opt/aws/bin/cfn-signal -e $${?} --stack ${stack_name} --resource AutoScalingGroup --region ${region}

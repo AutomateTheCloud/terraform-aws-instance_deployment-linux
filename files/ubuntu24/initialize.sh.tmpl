@@ -1,0 +1,25 @@
+#!/bin/bash -x
+
+> /var/log/audit/audit.log
+> /var/log/auth.log
+> /var/log/sudo.log
+> /var/log/syslog
+
+apt -y update
+apt -y upgrade
+
+if [ ! -f "/etc/init.d/cfn-hup" ]; then
+    DEBIAN_FRONTEND=noninteractive apt -y -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" install python3-pip
+    pip3 install https://s3.amazonaws.com/cloudformation-examples/aws-cfn-bootstrap-py3-latest.tar.gz
+    ln -s /usr/local/init/ubuntu/cfn-hup /etc/init.d/cfn-hup
+fi
+
+if ! dpkg-query -W amazon-cloudwatch-agent > /dev/null 2>&1; then
+    DEBIAN_FRONTEND=noninteractive apt -y -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" install wget
+    wget -O /tmp/amazon-cloudwatch-agent.deb https://amazoncloudwatch-agent.s3.amazonaws.com/ubuntu/$(dpkg --print-architecture)/latest/amazon-cloudwatch-agent.deb
+    dpkg --install /tmp/amazon-cloudwatch-agent.deb
+    rm -f /tmp/amazon-cloudwatch-agent.deb
+fi
+
+/usr/local/bin/cfn-init -v --stack ${stack_name} --resource LaunchTemplate --region ${region} --configset "LinuxConfig,InstallConfigure"
+/usr/local/bin/cfn-signal -e $${?} --stack ${stack_name} --resource AutoScalingGroup --region ${region}

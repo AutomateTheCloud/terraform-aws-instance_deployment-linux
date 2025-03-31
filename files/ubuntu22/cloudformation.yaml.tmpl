@@ -1,0 +1,415 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: "${scope_name} - ${purpose_name} (${environment_abbr}) - [${region_name}]"
+
+Resources:
+  LaunchTemplate:
+    Type: "AWS::EC2::LaunchTemplate"
+    Properties:
+      LaunchTemplateName: "${scope_abbr}-${purpose_abbr}-${environment_abbr}-${region_abbr}"
+      LaunchTemplateData:
+        MetadataOptions:
+          HttpEndpoint: enabled
+          HttpPutResponseHopLimit: ${try(ec2.imdsv2_hop_limit, "4")}
+          HttpTokens: "${try(ec2.imdsv2, "required")}"
+        ImageId: "${ami_id}"
+%{ if try(ec2.key_pair_name, null) != null }
+        KeyName: "${ec2.key_pair_name}"
+%{ endif }
+        IamInstanceProfile:
+          Arn: "${iam_instance_profile}"
+        SecurityGroupIds:
+          - "${security_group_id}"
+        InstanceInitiatedShutdownBehavior: "terminate"
+        Monitoring:
+          Enabled: "true"
+        CreditSpecification: ${try(ec2.credit_specification, "!Ref 'AWS::NoValue'")}
+        BlockDeviceMappings:
+          - DeviceName: "/dev/sda1"
+            Ebs:
+              VolumeSize: ${ec2.volume.root.size_gb}
+              VolumeType: ${try(ec2.volume.root.type, "gp3")}
+              Iops: ${try(ec2.volume.root.iops, "!Ref 'AWS::NoValue'")}
+              Encrypted: true
+%{ for volume in volume_data_disks ~}
+          - DeviceName: "${volume}"
+            Ebs:
+              VolumeSize: ${ec2.volume.data.size_gb}
+              VolumeType: ${try(ec2.volume.data.type, "gp3")}
+              Iops: ${try(ec2.volume.data.iops, "!Ref 'AWS::NoValue'")}
+              Encrypted: true
+%{ endfor ~}
+        TagSpecifications:
+          - ResourceType: "instance"
+            Tags:
+              - Key: "Name"
+                Value: "${scope_name} - ${purpose_name} (${environment_abbr}) [${region_name}]"
+              - Key: "StackName"
+                Value: !Ref "AWS::StackName"
+%{ for key, value in tags ~}
+              - Key: "${key}"
+                Value: "${value}"
+%{ endfor }
+          - ResourceType: "volume"
+            Tags:
+              - Key: "Name"
+                Value: "${scope_name} - ${purpose_name} (${environment_abbr}) [${region_name}]"
+              - Key: "StackName"
+                Value: !Ref "AWS::StackName"
+%{ for key, value in tags ~}
+              - Key: "${key}"
+                Value: "${value}"
+%{ endfor }
+        UserData: "${userdata}"
+    Metadata:
+      Comment: "Instance"
+      AWS::CloudFormation::Init:
+        configSets:
+          LinuxConfig:
+            - "ConfigureCFN"
+            - "ConfigureInstance"
+          InstallConfigure:
+%{ if try(ec2.cloudwatch.metrics.enabled, false) == true || try(ec2.cloudwatch.logs.enabled, true) == true }
+            - "ConfigureCloudWatch"
+%{ endif }
+%{ if codedeploy != null }
+            - "BootstrapCodeDeploy"
+%{ endif }
+        ConfigureCFN:
+          files:
+            "/etc/cfn/cfn-hup.conf":
+              content: !Sub |
+                [main]
+                stack=$${AWS::StackId}
+                region=$${AWS::Region}
+              mode:  "000400"
+              owner: "root"
+              group: "root"
+            "/etc/cfn/hooks.d/cfn-auto-reloader.conf":
+              content: !Sub |
+                [cfn-auto-reloader-hook]
+                triggers=post.update
+                path=Resources.LaunchTemplate.Metadata.AWS::CloudFormation::Init
+                action=/usr/local/bin/cfn-init -v --stack $${AWS::StackName} --resource LaunchTemplate --region $${AWS::Region}
+                runas=root
+            "/lib/systemd/system/cfn-hup.service":
+              content: |
+                [Unit]
+                Description=cfn-hup daemon
+                [Service]
+                Type=simple
+                ExecStart=/usr/local/bin/cfn-hup
+                Restart=always
+                [Install]
+                WantedBy=multi-user.target
+              mode: "000644"
+              owner: root
+              group: root
+          commands:
+            01-enable_cfn_hup:
+              command: systemctl enable cfn-hup.service
+            02-start_cfn_hup:
+              command: systemctl start cfn-hup.service
+        ConfigureInstance:
+          files:
+            "/deploy/instance.dat":
+              content: !Sub |
+                INSTANCE_SCOPE_NAME="${scope_name}"
+                INSTANCE_SCOPE_ABBR="${scope_abbr}"
+                INSTANCE_PURPOSE_NAME="${purpose_name}"
+                INSTANCE_PURPOSE_ABBR="${purpose_abbr}"
+                INSTANCE_ENVIRONMENT_NAME="${environment_name}"
+                INSTANCE_ENVIRONMENT_ABBR="${environment_abbr}"
+                INSTANCE_REGION_NAME="${region_name}"
+                INSTANCE_REGION_ABBR="${region_abbr}"
+              mode:  "000444"
+              owner: "root"
+              group: "root"
+            "/deploy/bootstrap.swap.sh":
+              content: !Sub |
+                #!/bin/bash
+                ###------------------------------------------------------------------------------------------------
+                # purpose: Configures Swap File
+                # usage:
+                #          -s <size_in_mb> : Swap Size in MB
+                ###------------------------------------------------------------------------------------------------
+                SWAP_FILE="/var/swapfile"
+                SWAP_SIZE=""
+                TMP_ERROR_MSG=""
+                ###------------------------------------------------------------------------------------------------
+                ## Main
+                while getopts "s:" OPTION; do
+                    case $${!OPTION} in
+                        s) SWAP_SIZE=$${!OPTARG};;
+                        *) echo "ERROR: There is an error with one or more of the arguments"; exit 5;;
+                        ?) echo "ERROR: There is an error with one or more of the arguments"; exit 5;;
+                    esac
+                done
+                echo "Bootstrap (Swap): Started"
+                echo "- File: [$${!SWAP_FILE}]"
+                echo "- Size: [$${!SWAP_SIZE} mb]"
+                sync; sleep 0.25
+                swapoff -a
+                sync; sleep 0.25
+                echo "Creating swap file"
+                touch $${!SWAP_FILE}
+                > $${!SWAP_FILE}
+                sync; sleep 0.25
+                dd if=/dev/zero of=$${!SWAP_FILE} bs=1M count=$${!SWAP_SIZE}
+                RETURNVAL="$?"
+                if [ $${!RETURNVAL} -ne 0 ]; then
+                    echo "ERROR: Failed to create swap file (dd_returned::$${!RETURNVAL})"
+                    exit 1
+                fi
+                chmod 600 $${!SWAP_FILE}
+                echo "Initializing swap file"
+                sync; sleep 0.25
+                mkswap $${!SWAP_FILE}
+                RETURNVAL="$?"
+                if [ $${!RETURNVAL} -ne 0 ]; then
+                    echo "ERROR: Failed to initialize swap file (mkswap_Returned::$${!RETURNVAL})"
+                    exit 1
+                fi
+                echo "Enable swap file"
+                sync; sleep 0.25
+                swapon $${!SWAP_FILE}
+                RETURNVAL="$?"
+                if [ $${!RETURNVAL} -ne 0 ]; then
+                    echo "ERROR: Failed to enable swap file (swapon_Returned::$${!RETURNVAL})"
+                    exit 1
+                fi
+                echo "Bootstrap (Swap): Finished"
+                exit 0
+              mode:  "000744"
+              owner: "root"
+              group: "root"
+          commands:
+            01-configure_swap:
+              command: /deploy/bootstrap.swap.sh -s ${try(ec2.volume.swap.size_mb, "2048")}
+%{ if efs_file_system != null }
+            02-mount_nfs:
+              command: !Sub |
+                apt -y update && DEBIAN_FRONTEND=noninteractive apt -y -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" install nfs-common
+                mkdir -p /efs
+                export TMP_AWS_METADATA_TOKEN="$(curl --retry 3 --silent --fail -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 21600")" 
+                mount -t nfs4 -o vers=4.1 $(curl -s -H "X-aws-ec2-metadata-token: $${!TMP_AWS_METADATA_TOKEN}" http://169.254.169.254/latest/meta-data/placement/availability-zone).${efs_file_system.id}.efs.$(curl -s -H "X-aws-ec2-metadata-token: $${!TMP_AWS_METADATA_TOKEN}" http://169.254.169.254/latest/dynamic/instance-identity/document|grep region|awk -F\" '{print $4}').amazonaws.com:/ /efs
+%{ endif }
+%{ if try(ec2.cloudwatch.metrics.enabled, false) == true || try(ec2.cloudwatch.logs.enabled, true) == true }
+        ConfigureCloudWatch:
+          files:
+            "/opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json":
+              content: !Sub |
+                {
+%{ if try(ec2.cloudwatch.metrics.enabled, false) == true }
+                  "metrics": {
+                    "namespace": "CloudWatchAgent",
+                    "append_dimensions": {
+                      "AutoScalingGroupName": "$${!aws:AutoScalingGroupName}",
+                      "ImageId": "$${!aws:ImageId}",
+                      "InstanceId": "$${!aws:InstanceId}",
+                      "InstanceType": "$${!aws:InstanceType}"
+                    },
+                    "metrics_collected": {
+                      "cpu": {
+                        "measurement": [
+                          "cpu_usage_idle",
+                          "cpu_usage_iowait",
+                          "cpu_usage_user",
+                          "cpu_usage_system"
+                        ],
+                        "metrics_collection_interval": 60,
+                        "resources": [
+                          "*"
+                        ],
+                        "totalcpu": false
+                      },
+                      "disk": {
+                        "measurement": [
+                          "used_percent",
+                          "inodes_free"
+                        ],
+                        "metrics_collection_interval": 60,
+                        "resources": [
+                          "/"
+                        ]
+                      },
+                      "diskio": {
+                        "measurement": [
+                          "io_time",
+                          "write_bytes",
+                          "read_bytes",
+                          "writes",
+                          "reads"
+                        ],
+                        "metrics_collection_interval": 60,
+                        "resources": [
+                          "*"
+                        ]
+                      },
+                      "mem": {
+                        "measurement": [
+                          "mem_used_percent"
+                        ],
+                        "metrics_collection_interval": 60
+                      },
+                      "netstat": {
+                        "measurement": [
+                          "tcp_established",
+                          "tcp_time_wait"
+                        ],
+                        "metrics_collection_interval": 60
+                      },
+                      "swap": {
+                        "measurement": [
+                          "swap_used_percent"
+                        ],
+                        "metrics_collection_interval": 60
+                      }
+                    }
+                  },
+%{ endif }
+%{ if try(ec2.cloudwatch.logs.enabled, true) == true }
+                  "logs": {
+                    "logs_collected": {
+                      "files": {
+                        "collect_list": [
+                          {
+                            "file_path": "/var/log/audit/audit.log",
+                            "log_group_name": "${try(ec2.cloudwatch.logs.audit.log_group_name, "/aws/ec2/linux/audit")}",                            
+                            "log_stream_name": "{instance_id}"
+                          },
+                          {
+                            "file_path": "/var/log/auth.log",
+                            "log_group_name": "${try(ec2.cloudwatch.logs.auth.log_group_name, "/aws/ec2/linux/auth")}",                            
+                            "log_stream_name": "{instance_id}"
+                          },
+                          {
+                            "file_path": "/var/log/sudo.log",
+                            "log_group_name": "${try(ec2.cloudwatch.logs.sudo.log_group_name, "/aws/ec2/linux/sudo")}",                            
+                            "log_stream_name": "{instance_id}"
+                          },
+                          {
+                            "file_path": "/var/log/syslog",
+                            "log_group_name": "${try(ec2.cloudwatch.logs.syslog.log_group_name, "/aws/ec2/linux/syslog")}",                            
+                            "log_stream_name": "{instance_id}"
+                          }
+                        ]
+                      }
+                    }
+                  }
+%{ endif }
+                }
+              mode:  "000640"
+              owner: "root"
+              group: "root"
+          commands:
+            01-enable-cloudwatch:
+              command: systemctl enable amazon-cloudwatch-agent.service
+            02-start-cloudwatch:
+              command: systemctl start amazon-cloudwatch-agent.service
+%{ endif }
+%{ if codedeploy != null }
+        BootstrapCodeDeploy:
+          files:
+            "/deploy/codedeploy.dat":
+              content: !Sub |
+                CODEDEPLOY_APPLICATION_NAME="${codedeploy.app.name}"
+%{ for cloudwatch_log_group_name in codedeploy.app.cloudwatch_log_group_names ~}
+                CODEDEPLOY_LOG_GROUP_${upper(cloudwatch_log_group_name)}="/${scope_abbr}/${purpose_abbr}/${environment_abbr}/application/${codedeploy.app.name}/${cloudwatch_log_group_name}"
+%{ endfor ~}
+              mode:  "000444"
+              owner: "root"
+              group: "root"
+          commands:
+            01-install-codedeploy:
+              command: !Sub |
+                if [ ! -f "/etc/init.d/codedeploy-agent" ]; then
+                  apt -y update; DEBIAN_FRONTEND=noninteractive apt -y -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" install ruby curl
+                  curl -o /tmp/codedeploy-installer https://aws-codedeploy-${region_name}.s3.amazonaws.com/latest/install
+                  chmod +x /tmp/codedeploy-installer
+                  /tmp/codedeploy-installer auto
+                  rm -f /tmp/codedeploy-installer
+                fi
+          services:
+            sysvinit:
+              codedeploy-agent:
+                enabled: 'true'
+                ensureRunning: 'true'
+%{ endif }
+
+  AutoScalingGroup:
+    Type: "AWS::AutoScaling::AutoScalingGroup"
+    Properties:
+      AutoScalingGroupName: "${scope_abbr}-${purpose_abbr}-${environment_abbr}-${region_abbr}"
+      VPCZoneIdentifier: ["${join("\",\"", subnets)}"]
+      MixedInstancesPolicy:
+        InstancesDistribution:
+          OnDemandAllocationStrategy: "prioritized"
+          OnDemandBaseCapacity: ${auto_scaling_group.ondemand_base_capacity}
+          OnDemandPercentageAboveBaseCapacity: ${try(auto_scaling_group.ondemand_percentage, "100")}
+          SpotAllocationStrategy: ${try(auto_scaling_group.spot_allocation_strategy, "!Ref 'AWS::NoValue'")}
+%{ if auto_scaling_group.spot_allocation_strategy == "lowest-price" }
+          SpotInstancePools: "${length(ec2.instance_types)}"
+%{ endif }
+        LaunchTemplate:
+          LaunchTemplateSpecification:
+            LaunchTemplateId: !Ref "LaunchTemplate"
+            Version: !GetAtt "LaunchTemplate.LatestVersionNumber"
+          Overrides:
+%{ for instance_type in ec2.instance_types ~}
+            - InstanceType: "${instance_type.type}"
+              WeightedCapacity: "${instance_type.weighted_capacity}"
+%{ endfor ~}
+      MinSize: ${auto_scaling_group.min_size}
+      MaxSize: ${auto_scaling_group.max_size}
+      DesiredCapacity: ${auto_scaling_group.desired_capacity}
+%{ if try(auto_scaling_group.max_instance_lifetime, 0) > 0 }
+      MaxInstanceLifetime: ${auto_scaling_group.max_instance_lifetime}
+%{ endif }
+      Cooldown: ${try(auto_scaling_group.cooldown_period, "300")}
+      HealthCheckGracePeriod: ${try(auto_scaling_group.health_check_grace_period, "300")}
+%{ if lb_identifier_string != null }
+      HealthCheckType: "ELB"
+      ${lb_identifier_string}: ${lb_targets}
+%{ else }
+      HealthCheckType: "EC2"
+%{ endif }
+      MetricsCollection:
+        - Granularity: "1Minute"
+      TerminationPolicies:
+        - "OldestInstance"
+        - "Default"
+      Tags:
+%{ for key, value in tags ~}
+        - Key: "${key}"
+          Value: "${value}"
+          PropagateAtLaunch: "true"
+%{ endfor }
+    CreationPolicy:
+      AutoScalingCreationPolicy:
+        MinSuccessfulInstancesPercent: 0
+      ResourceSignal:
+        Count: ${try(auto_scaling_group.resource_signal_count, "0")}
+        Timeout: ${try(auto_scaling_group.update_timeout, "PT0S")}
+    UpdatePolicy:
+      AutoScalingScheduledAction:
+        IgnoreUnmodifiedGroupSizeProperties: true
+      AutoScalingRollingUpdate:
+        MinInstancesInService: ${try(auto_scaling_group.update_min_in_service, "0")}
+        MinSuccessfulInstancesPercent: ${try(auto_scaling_group.min_successful_instances_percent, "!Ref 'AWS::NoValue'")}
+        MaxBatchSize: ${try(auto_scaling_group.update_max_batch_size, "1")}
+        PauseTime: ${try(auto_scaling_group.update_timeout, "PT0S")}
+        SuspendProcesses:
+          - HealthCheck
+          - ReplaceUnhealthy
+          - AZRebalance
+          - AlarmNotification
+          - ScheduledActions
+        WaitOnResourceSignals: ${try(auto_scaling_group.update_wait_on_resource_signals, "false")}
+
+Outputs:
+  AutoScalingGroupId:
+    Description: "AutoScalingGroup: ID"
+    Value: !Ref "AutoScalingGroup"
+  LaunchTemplateId:
+    Description: "Launch Template: ID"
+    Value: !Ref "LaunchTemplate"

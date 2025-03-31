@@ -1,0 +1,4 @@
+#!/bin/bash -x
+dnf -y update
+/opt/aws/bin/cfn-init -v --stack ${stack_name} --resource LaunchTemplate --region ${region} --configset "LinuxConfig,InstallConfigure"
+/opt/aws/bin/cfn-signal -e $${?} --stack ${stack_name} --resource AutoScalingGroup --region ${region}
